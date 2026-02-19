@@ -6,20 +6,23 @@
 2. 问答对话：基于小说内容的智能问答
 """
 import shutil
-import tempfile
 from pathlib import Path
 
 import gradio as gr
 
-from config import DATA_DIR, GOOGLE_API_KEY
-from ingest import ingest
-from rag_chain import ask, reload_chain
+from config import DATA_DIR, config
+from services.ingest_service import ingest
+from services.qa_service import ask, reload_chain
+from utils.exceptions import NovelRAGError
+from utils.logger import get_logger
+
+logger = get_logger("novel_rag.app")
 
 
 # ── 文档上传处理 ──────────────────────────────────────────
 def handle_upload(files) -> str:
     """处理上传的 .txt 文件"""
-    if not GOOGLE_API_KEY:
+    if not config.is_configured:
         return "❌ 请先设置环境变量 GOOGLE_API_KEY"
 
     if not files:
@@ -36,21 +39,25 @@ def handle_upload(files) -> str:
         dest = DATA_DIR / file_path.name
         shutil.copy2(str(file_path), str(dest))
         uploaded.append(file_path.name)
+        logger.info(f"文件已上传: {file_path.name}")
 
-    # 执行摄取
     try:
-        ingest()
+        ingest(DATA_DIR)
         reload_chain()
         file_list = "\n".join(f"  • {name}" for name in uploaded)
         return f"✅ 成功上传并摄取以下文件：\n{file_list}\n\n现在可以开始提问了！"
+    except NovelRAGError as e:
+        logger.error(f"摄取失败: {e}")
+        return f"❌ 摄取过程出错：{e.message}"
     except Exception as e:
+        logger.error(f"未知错误: {e}")
         return f"❌ 摄取过程出错：{str(e)}"
 
 
 # ── 问答处理 ──────────────────────────────────────────────
 def handle_question(question: str, history: list) -> str:
     """处理用户提问"""
-    if not GOOGLE_API_KEY:
+    if not config.is_configured:
         return "❌ 请先设置环境变量 GOOGLE_API_KEY"
 
     if not question.strip():
@@ -60,7 +67,6 @@ def handle_question(question: str, history: list) -> str:
         result = ask(question)
         answer = result["answer"]
 
-        # 附加参考来源
         if result["sources"]:
             answer += "\n\n---\n📖 **参考段落：**\n"
             for i, src in enumerate(result["sources"], 1):
@@ -69,7 +75,11 @@ def handle_question(question: str, history: list) -> str:
                 answer += f"\n**[{i}]** `{source_file}`\n> {content_preview}...\n"
 
         return answer
+    except NovelRAGError as e:
+        logger.error(f"问答失败: {e}")
+        return f"❌ 回答生成出错：{e.message}"
     except Exception as e:
+        logger.error(f"未知错误: {e}")
         return f"❌ 回答生成出错：{str(e)}"
 
 
@@ -83,7 +93,10 @@ def list_documents() -> str:
     if not txt_files:
         return "📂 暂无文档"
 
-    file_list = "\n".join(f"  • {f.name} ({f.stat().st_size / 1024:.1f} KB)" for f in txt_files)
+    file_list = "\n".join(
+        f"  • {f.name} ({f.stat().st_size / 1024:.1f} KB)" 
+        for f in txt_files
+    )
     return f"📚 已有 {len(txt_files)} 个文档：\n{file_list}"
 
 
@@ -109,10 +122,7 @@ CUSTOM_CSS = """
 
 # ── 构建 Gradio 界面 ─────────────────────────────────────
 def create_app() -> gr.Blocks:
-    with gr.Blocks(
-        title="📖 小说 RAG 知识库",
-    ) as app:
-        # 标题
+    with gr.Blocks(title="📖 小说 RAG 知识库") as app:
         gr.HTML("""
         <div class="main-header">
             <h1>📖 小说 RAG 知识库</h1>
@@ -121,7 +131,6 @@ def create_app() -> gr.Blocks:
         """)
 
         with gr.Tabs():
-            # ── Tab 1: 问答对话 ──
             with gr.Tab("💬 智能问答", id="qa"):
                 chatbot = gr.Chatbot(
                     label="对话",
@@ -137,7 +146,6 @@ def create_app() -> gr.Blocks:
                     )
                     submit_btn = gr.Button("发送", variant="primary", scale=1)
 
-                # 问答逻辑
                 def chat(question, history):
                     if not question.strip():
                         return history, ""
@@ -158,7 +166,6 @@ def create_app() -> gr.Blocks:
                     outputs=[chatbot, question_input],
                 )
 
-            # ── Tab 2: 文档管理 ──
             with gr.Tab("📁 文档管理", id="docs"):
                 with gr.Row():
                     with gr.Column(scale=1):
@@ -200,6 +207,7 @@ def create_app() -> gr.Blocks:
 
 # ── 启动 ─────────────────────────────────────────────────
 if __name__ == "__main__":
+    logger.info("启动 Web 应用")
     app = create_app()
     app.launch(
         server_name="0.0.0.0",
